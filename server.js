@@ -26,7 +26,7 @@ app.use((req, res, next) => {
 })
 
 // ── Session Store ─────────────────────────────────────────────
-const sessions = new NodeCache({ stdTTL: 0 })
+const sessions = new NodeCache({ stdTTL: 0, useClones: false })
 const qrCache  = new NodeCache({ stdTTL: 120 })
 
 // Silent logger — avoids pino private field issues on Render
