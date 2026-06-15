@@ -185,7 +185,7 @@ async function createSession(adminId) {
 
     // Wait for QR (up to 10s)
     for (let i = 0; i < 10; i++) {
-      await new Promise(r => setTimeout(r, 1000))
+      await new Promise(r => setTimeout(r, 3000))
       if (qrCache.has(sessionKey)) break
       const s = sessions.get(sessionKey)
       if (s?.isConnected) return { sessionKey, connected: true, phone: s.phone }
@@ -240,7 +240,7 @@ async function createPairingSession(adminId, phoneNumber) {
 
     // Wait for socket to be ready (up to 5s)
     for (let i = 0; i < 5; i++) {
-      await new Promise(r => setTimeout(r, 1000))
+      await new Promise(r => setTimeout(r, 3000))
       try {
         pairingCode = await sock.requestPairingCode(cleanPhone)
         break
