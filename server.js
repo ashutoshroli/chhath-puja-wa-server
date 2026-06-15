@@ -1,4 +1,5 @@
 import express from 'express'
+import fs from 'fs'
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -29,40 +30,70 @@ app.use((req, res, next) => {
 const sessions = new NodeCache({ stdTTL: 0, useClones: false })
 const qrCache  = new NodeCache({ stdTTL: 120 })
 
-// Silent logger — avoids pino private field issues on Render
+// Silent logger
 const logger = pino({ level: 'silent' })
+
+// ── Helper: clear auth folder ─────────────────────────────────
+function clearAuth(adminId) {
+  const authFolder = `/tmp/wa_auth_${adminId}`
+  if (fs.existsSync(authFolder)) {
+    fs.rmSync(authFolder, { recursive: true, force: true })
+    console.log(`[${adminId}] Auth folder cleared`)
+  }
+}
+
+// ── Helper: kill existing socket ──────────────────────────────
+function killSession(adminId) {
+  const sessionKey = `session_${adminId}`
+  const existing = sessions.get(sessionKey)
+  if (existing?.sock) {
+    try { existing.sock.end() } catch (_) {}
+    try { existing.sock.ws?.close() } catch (_) {}
+  }
+  sessions.del(sessionKey)
+  qrCache.del(sessionKey)
+}
 
 // ── Create/Get WA Session ─────────────────────────────────────
 async function createSession(adminId) {
-  const sessionKey = `session_${adminId}`
+  const sessionKey  = `session_${adminId}`
+  const authFolder  = `/tmp/wa_auth_${adminId}`
 
+  // ✅ FIX 1: If auth folder missing but session cached → ghost session, clear it
+  if (!fs.existsSync(authFolder) && sessions.has(sessionKey)) {
+    console.log(`[${adminId}] Ghost session detected, clearing...`)
+    killSession(adminId)
+  }
+
+  // Return existing live session
   if (sessions.has(sessionKey)) {
     const existing = sessions.get(sessionKey)
-    if (existing.isConnected) return { sessionKey, connected: true, phone: existing.phone }
+    if (existing?.isConnected) return { sessionKey, connected: true, phone: existing.phone }
     if (qrCache.has(sessionKey)) return { sessionKey, qr: qrCache.get(sessionKey) }
   }
 
-  const authFolder = `/tmp/wa_auth_${adminId}`
   const { state, saveCreds } = await useMultiFileAuthState(authFolder)
-  const { version } = await fetchLatestBaileysVersion()
-
-  // ✅ KEY FIX: use makeCacheableSignalKeyStore to avoid #context private field clash
+  const { version }          = await fetchLatestBaileysVersion()
   const msgRetryCounterCache = new NodeCache()
 
   const sock = makeWASocket({
     version,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
+      keys:  makeCacheableSignalKeyStore(state.keys, logger),
     },
     logger,
     printQRInTerminal: false,
-    browser: ['Chhath Puja Portal', 'Chrome', '1.0'],
+    // ✅ FIX 2: Use standard browser string
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
     connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 30_000,
     msgRetryCounterCache,
-    // ✅ Disable features that trigger #context issues on Node 20
     generateHighQualityLinkPreview: false,
     shouldIgnoreJid: jid => jid.includes('broadcast'),
+    // ✅ FIX 3: Retry on connection failure
+    retryRequestDelayMs: 2000,
+    maxMsgRetryCount: 3,
   })
 
   sessions.set(sessionKey, { sock, isConnected: false, phone: null })
@@ -85,26 +116,51 @@ async function createSession(adminId) {
       const phone = sock.user?.id?.split(':')[0] || 'Unknown'
       sessions.set(sessionKey, { sock, isConnected: true, phone })
       qrCache.del(sessionKey)
-      console.log(`[${adminId}] Connected: ${phone}`)
+      console.log(`[${adminId}] ✅ Connected: ${phone}`)
     }
 
     if (connection === 'close') {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+      console.log(`[${adminId}] ❌ Disconnected. Code: ${statusCode}`)
+
       sessions.set(sessionKey, { sock: null, isConnected: false, phone: null })
 
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log(`[${adminId}] Reconnecting... (reason: ${statusCode})`)
-        setTimeout(() => createSession(adminId), 5000)
-      } else {
-        console.log(`[${adminId}] Logged out`)
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.log(`[${adminId}] Logged out — clearing auth`)
+        clearAuth(adminId)
         sessions.del(sessionKey)
         qrCache.del(sessionKey)
+      } else if (
+        statusCode === DisconnectReason.connectionClosed ||
+        statusCode === DisconnectReason.connectionLost ||
+        statusCode === DisconnectReason.timedOut ||
+        statusCode === 408 ||
+        statusCode === 503
+      ) {
+        // ✅ FIX 4: Auto-reconnect on network issues
+        console.log(`[${adminId}] Reconnecting in 5s...`)
+        setTimeout(() => createSession(adminId), 5000)
+      } else if (statusCode === DisconnectReason.badSession) {
+        // ✅ FIX 5: Bad session → wipe auth and restart fresh
+        console.log(`[${adminId}] Bad session — wiping auth and restarting`)
+        clearAuth(adminId)
+        sessions.del(sessionKey)
+        qrCache.del(sessionKey)
+        setTimeout(() => createSession(adminId), 3000)
+      } else {
+        console.log(`[${adminId}] Unknown disconnect code: ${statusCode}, reconnecting...`)
+        setTimeout(() => createSession(adminId), 8000)
       }
     }
   })
 
-  // Wait for QR to appear
-  await new Promise(r => setTimeout(r, 5000))
+  // Wait for QR to appear (up to 10s)
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 1000))
+    if (qrCache.has(sessionKey)) break
+    const s = sessions.get(sessionKey)
+    if (s?.isConnected) return { sessionKey, connected: true, phone: s.phone }
+  }
 
   if (qrCache.has(sessionKey)) {
     return { sessionKey, qr: qrCache.get(sessionKey) }
@@ -113,20 +169,22 @@ async function createSession(adminId) {
   const s = sessions.get(sessionKey)
   if (s?.isConnected) return { sessionKey, connected: true, phone: s.phone }
 
-  return { sessionKey, error: 'QR generate nahi hua — please retry /qr endpoint' }
+  return { sessionKey, error: 'QR generate nahi hua — /reset karke dobara try karein' }
 }
 
-// ── ROUTES ───────────────────────────────────────────────────
+// ── ROUTES ────────────────────────────────────────────────────
 
+// Health check
 app.get('/', (req, res) => {
   res.json({
-    status: 'ok',
-    message: 'Chhath Puja WA Server 🎉',
+    status:   'ok',
+    message:  'Chhath Puja WA Server 🎉',
     sessions: sessions.keys().length,
-    uptime: `${Math.floor(process.uptime())}s`,
+    uptime:   `${Math.floor(process.uptime())}s`,
   })
 })
 
+// Get QR
 app.get('/qr', async (req, res) => {
   const { adminId } = req.query
   if (!adminId) return res.status(400).json({ error: 'adminId required' })
@@ -140,26 +198,31 @@ app.get('/qr', async (req, res) => {
   }
 })
 
+// Status check
 app.get('/status', (req, res) => {
-  const { sessionKey } = req.query
-  if (!sessionKey) return res.status(400).json({ error: 'sessionKey required' })
+  const { adminId, sessionKey } = req.query
+  const key = adminId ? `session_${adminId}` : sessionKey
 
-  const session = sessions.get(sessionKey)
+  if (!key) return res.status(400).json({ error: 'adminId or sessionKey required' })
+
+  const session = sessions.get(key)
   if (!session) return res.json({ connected: false })
 
   res.json({ connected: session.isConnected, phone: session.phone || null })
 })
 
+// Send message
 app.post('/send', async (req, res) => {
-  const { sessionKey, to, message } = req.body
+  const { sessionKey, adminId, to, message } = req.body
+  const key = sessionKey || (adminId ? `session_${adminId}` : null)
 
-  if (!sessionKey || !to || !message) {
-    return res.status(400).json({ error: 'sessionKey, to, message required' })
+  if (!key || !to || !message) {
+    return res.status(400).json({ error: 'sessionKey/adminId, to, message required' })
   }
 
-  const session = sessions.get(sessionKey)
+  const session = sessions.get(key)
   if (!session?.isConnected || !session.sock) {
-    return res.status(400).json({ error: 'Session connected nahi hai' })
+    return res.status(400).json({ error: 'Session connected nahi hai — pehle QR scan karein' })
   }
 
   try {
@@ -170,20 +233,39 @@ app.post('/send', async (req, res) => {
     await session.sock.sendMessage(jid, { text: message })
     res.json({ success: true, to: jid })
   } catch (err) {
+    console.error('[/send error]', err)
     res.status(500).json({ error: err.message })
   }
 })
 
-app.get('/disconnect', async (req, res) => {
-  const { sessionKey } = req.query
-  const session = sessions.get(sessionKey)
+// ✅ NEW: Reset session (fixes "Couldn't link device")
+app.get('/reset', async (req, res) => {
+  const { adminId } = req.query
+  if (!adminId) return res.status(400).json({ error: 'adminId required' })
 
+  try {
+    killSession(adminId)
+    clearAuth(adminId)
+    res.json({ success: true, message: 'Reset ho gaya — ab /qr call karein' })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Disconnect (logout)
+app.get('/disconnect', async (req, res) => {
+  const { adminId, sessionKey } = req.query
+  const id  = adminId || sessionKey?.replace('session_', '')
+  const key = adminId ? `session_${adminId}` : sessionKey
+
+  const session = sessions.get(key)
   if (session?.sock) {
     try { await session.sock.logout() } catch (_) {}
   }
 
-  sessions.del(sessionKey)
-  qrCache.del(sessionKey)
+  killSession(id)
+  clearAuth(id)
+
   res.json({ success: true })
 })
 
