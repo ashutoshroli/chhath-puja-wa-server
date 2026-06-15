@@ -251,8 +251,7 @@ async function createPairingSession(adminId, phoneNumber) {
     }
 
     // Format: XXXX-XXXX
-    const formatted = pairingCode?.match(/.{1,4}/g)?.join('-') || pairingCode
-
+    const formatted = pairingCode?.replace(/-/g, '').match(/.{1,4}/g)?.join('-') || pairingCode
     // Store in session
     const s = sessions.get(sessionKey) || {}
     sessions.set(sessionKey, { ...s, pairingCode: formatted })
