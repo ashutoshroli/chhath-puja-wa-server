@@ -1,6 +1,6 @@
 import express from 'express'
 import pkg from 'whatsapp-web.js'
-const { Client, LocalAuth, LinkingMethod } = pkg
+const { Client, LocalAuth } = pkg
 import qrcode from 'qrcode'
 import NodeCache from 'node-cache'
 
@@ -59,7 +59,8 @@ async function createWAClient(adminId, usePairingCode = false, phoneNumber = nul
   if (usePairingCode && phoneNumber) {
     let cleanPhone = phoneNumber.toString().replace(/[^0-9]/g, '')
     if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone
-    clientOptions.linkingMethod = new LinkingMethod({ phone: cleanPhone })
+    clientOptions.pairingCode = true
+    clientOptions.phone = cleanPhone
   }
 
   const client = new Client(clientOptions)
@@ -76,15 +77,20 @@ async function createWAClient(adminId, usePairingCode = false, phoneNumber = nul
       } catch (err) {
         console.error(`[${adminId}] QR generation failed:`, err.message)
       }
+    } else {
+      // Pairing mode mein QR aane pe code request karo
+      try {
+        let cleanPhone = phoneNumber.toString().replace(/[^0-9]/g, '')
+        if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone
+        const code = await client.requestPairingCode(cleanPhone)
+        const formatted = code?.replace(/-/g, '').match(/.{1,4}/g)?.join('-') || code
+        console.log(`[${adminId}] 📱 Pairing code: ${formatted}`)
+        const s = sessions.get(sessionKey) || {}
+        sessions.set(sessionKey, { ...s, pairingCode: formatted })
+      } catch (err) {
+        console.error(`[${adminId}] Pairing code error:`, err.message)
+      }
     }
-  })
-
-  // Pairing code event
-  client.on('code', (code) => {
-    const formatted = code?.replace(/-/g, '').match(/.{1,4}/g)?.join('-') || code
-    console.log(`[${adminId}] 📱 Pairing code: ${formatted}`)
-    const s = sessions.get(sessionKey) || {}
-    sessions.set(sessionKey, { ...s, pairingCode: formatted })
   })
 
   // Ready event
@@ -131,7 +137,6 @@ async function createSession(adminId) {
   creating.add(adminId)
 
   try {
-    // Already connected?
     if (sessions.has(sessionKey)) {
       const existing = sessions.get(sessionKey)
       if (existing?.isConnected) return { sessionKey, connected: true, phone: existing.phone }
@@ -140,7 +145,6 @@ async function createSession(adminId) {
 
     await createWAClient(adminId, false)
 
-    // Wait for QR (up to 30s)
     for (let i = 0; i < 15; i++) {
       await new Promise(r => setTimeout(r, 2000))
       if (qrCache.has(sessionKey)) break
@@ -171,7 +175,6 @@ async function createPairingSession(adminId, phoneNumber) {
   creating.add(adminId)
 
   try {
-    // Already connected?
     if (sessions.has(sessionKey)) {
       const existing = sessions.get(sessionKey)
       if (existing?.isConnected) return { sessionKey, connected: true, phone: existing.phone }
@@ -180,7 +183,6 @@ async function createPairingSession(adminId, phoneNumber) {
 
     await createWAClient(adminId, true, phoneNumber)
 
-    // Wait for pairing code (up to 30s)
     for (let i = 0; i < 15; i++) {
       await new Promise(r => setTimeout(r, 2000))
       const s = sessions.get(sessionKey)
@@ -197,7 +199,6 @@ async function createPairingSession(adminId, phoneNumber) {
 
 // ── ROUTES ────────────────────────────────────────────────────
 
-// Health check
 app.get('/', (req, res) => {
   res.json({
     status:   'ok',
@@ -207,11 +208,9 @@ app.get('/', (req, res) => {
   })
 })
 
-// ── QR Route ──────────────────────────────────────────────────
 app.get('/qr', async (req, res) => {
   const { adminId } = req.query
   if (!adminId) return res.status(400).json({ error: 'adminId required' })
-
   try {
     const result = await createSession(adminId)
     res.json(result)
@@ -221,10 +220,8 @@ app.get('/qr', async (req, res) => {
   }
 })
 
-// ── Pairing Code Route ────────────────────────────────────────
 app.get('/pair', async (req, res) => {
   const { adminId, phone } = req.query
-
   if (!adminId) return res.status(400).json({ error: 'adminId required' })
   if (!phone)   return res.status(400).json({ error: 'phone required (e.g. 919876543210)' })
 
@@ -242,11 +239,9 @@ app.get('/pair', async (req, res) => {
   }
 })
 
-// ── Status Route ──────────────────────────────────────────────
 app.get('/status', (req, res) => {
   const { adminId, sessionKey } = req.query
   const key = adminId ? `session_${adminId}` : sessionKey
-
   if (!key) return res.status(400).json({ error: 'adminId or sessionKey required' })
 
   const session = sessions.get(key)
@@ -259,7 +254,6 @@ app.get('/status', (req, res) => {
   })
 })
 
-// ── Send Message Route ────────────────────────────────────────
 app.post('/send', async (req, res) => {
   const { sessionKey, adminId, to, message } = req.body
   const key = sessionKey || (adminId ? `session_${adminId}` : null)
@@ -277,7 +271,6 @@ app.post('/send', async (req, res) => {
     let phone = to.toString().replace(/[^0-9]/g, '')
     if (!phone.startsWith('91')) phone = '91' + phone
     const chatId = `${phone}@c.us`
-
     await session.client.sendMessage(chatId, message)
     res.json({ success: true, to: chatId })
   } catch (err) {
@@ -286,11 +279,9 @@ app.post('/send', async (req, res) => {
   }
 })
 
-// ── Reset Route ───────────────────────────────────────────────
 app.get('/reset', async (req, res) => {
   const { adminId } = req.query
   if (!adminId) return res.status(400).json({ error: 'adminId required' })
-
   try {
     await killSession(adminId)
     res.json({ success: true, message: 'Reset ho gaya — ab /qr ya /pair call karein' })
@@ -299,17 +290,14 @@ app.get('/reset', async (req, res) => {
   }
 })
 
-// ── Disconnect Route ──────────────────────────────────────────
 app.get('/disconnect', async (req, res) => {
   const { adminId, sessionKey } = req.query
   const id = adminId || sessionKey?.replace('session_', '')
-
   const key = `session_${id}`
   const session = sessions.get(key)
   if (session?.client) {
     try { await session.client.logout() } catch (_) {}
   }
-
   await killSession(id)
   res.json({ success: true })
 })
